@@ -110,7 +110,7 @@ void onCanFrameReceived(const CanFrame& frame) {
 
 ### Compile
 ```bash
-git clone https://github.com/YOUR_USERNAME/autosar-idsm-toolkit.git
+git clone https://github.com/niketdhale/autosar-idsm-toolkit.git
 cd autosar-idsm-toolkit
 mkdir build && cd build
 cmake .. -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
