@@ -107,10 +107,15 @@ STD_RETURN_TYPE IdsM_Manager::DeInit() {
     if (m_worker_thread.joinable()) {
         m_worker_thread.join();
     }
-    
+
     std::lock_guard<std::mutex> lock(m_mutex);
     m_monitors.clear();
     m_current_mode = IDSM_POST_RUN_MODE;
+    m_dem_cb = nullptr;
+    m_nvm_cb = nullptr;
+    m_stats = Stats{};
+    /* Drain any leftover events from the incoming queue */
+    while (!m_incoming_queue.empty()) m_incoming_queue.pop();
     return E_OK;
 }
 

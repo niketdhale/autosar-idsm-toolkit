@@ -3,148 +3,385 @@
 A production-pattern, async-first C++17/C11 implementation of the AUTOSAR Intrusion Detection System Manager per specifications R20-11 & R22-11. Provides a thread-safe, non-blocking manager layer for orchestrating multiple IDS detectors, event buffering, flood protection, and seamless BSW integration.
 
 ## Features
+
 - **Async/Non-Blocking Core**: Background worker thread processes events instantly without blocking detector/communication threads
 - **AUTOSAR-Compliant C API**: `IdsM_Init`, `IdsM_ReportEvent`, `IdsM_SetOperatingMode`, `IdsM_MainFunction` (simulated)
+- **IDSRM SOC Forwarding**: HTTP POST violations to any Security Operations Center endpoint (Splunk, QRadar, Elastic, custom webhook)
 - **Pluggable Module Architecture**: Lightweight Adapter pattern for integrating CAN IDS, SecOC, FlexRay, Ethernet, or custom detectors
 - **Thread-Safe State Management**: Mutex-protected queues, condition variables, and atomic flags
 - **Event Buffering & Flood Protection**: Configurable per-monitor acceptance windows and anti-spam filtering
 - **Lifecycle Mode Management**: Pre-Run, Run, and Post-Run operating modes with selective monitor activation
-- **Zero External Dependencies**: Pure C11/C++17 + STL (no Qt, no Boost, no OpenSSL required)
-- **Interactive CLI**: Real-time testing, status querying, and diagnostic flushing
+- **Comprehensive Test Suite**: 39 tests (Google Test) covering IDSM unit, IDSRM unit, and HTTP integration
+- **Interactive CLI**: Real-time testing, status querying, IDSRM control, and diagnostic flushing
 
 ---
 
 ## Architecture Overview
 
-The IDSM follows a **Manager-Adapter-Detector** pattern aligned with AUTOSAR BSW layering:
+The toolkit follows a **Manager-Adapter-Detector** pattern aligned with AUTOSAR BSW layering, with an optional **IDSRM reporting** layer:
 
-[Physical/Logical Bus] → [Detector Engine] → [Adapter] → IdsM_ReportEvent() → [IDSM Manager (Async)] → [DEM Callback]
-CAN/FlexRay/Eth (CAN IDS) (C++ Class) (Non-Blocking) (Background Thread) (Diagnostics)
+```
+[Detector Engine] → [Adapter] → IdsM_ReportEvent()
+                                        ↓
+                                [IDSM Manager (Async Worker)]
+                                        ↓
+                                IdsM_DemReportCallback
+                                        ↓
+                          [IDSRM Worker Thread] → HTTP POST → SOC Endpoint
+```
 
-
-- **Detector Engine**: Validates frames/signals (e.g., `can-ids-toolkit`, SecOC verifier)
+- **Detector Engine**: Validates frames/signals (e.g., CAN IDS, SecOC verifier)
 - **Adapter**: Translates detector violations into `IdsM_EventReportType` and forwards to IDSM
 - **IDSM Manager**: Thread-safe queue + background worker handles buffering, flood protection, and DEM forwarding
-- **DEM Callback**: Simulates AUTOSAR Diagnostic Event Manager integration
+- **IDSRM Module**: Optional. Registers as the DEM callback, enqueues events to its own worker thread, and HTTP POSTs JSON to a configurable SOC URL via libcurl
 
 ---
+
+## Project Structure
+
+```
+autosar-idsm-toolkit/
+├── include/
+│   ├── IdsM_Types.h               # AUTOSAR type definitions, enums, config structs
+│   ├── IdsM.h                     # Public C API for IDSM
+│   ├── IdsM_Internal.h            # C++ IdsM_Manager singleton class
+│   ├── IdsM_Manager_Wrapper.h     # C/C++ bridge for IDSM
+│   ├── IdsRm_Types.h              # IDSRM config, stats, return codes
+│   ├── IdsRm.h                    # Public C API for IDSRM
+│   ├── IdsRm_Internal.h           # C++ IdsRm_Manager singleton class
+│   └── IdsRm_Manager_Wrapper.h    # C/C++ bridge for IDSRM
+├── src/
+│   ├── IdsM.c                     # IDSM C wrapper
+│   ├── IdsM_Manager.cpp           # IDSM async worker implementation
+│   ├── IdsRm.c                    # IDSRM C wrapper
+│   └── IdsRm_Manager.cpp          # IDSRM async HTTP forwarding (libcurl)
+├── apps/
+│   └── idsm_cli/
+│       └── main.cpp               # Interactive CLI with IDSRM commands
+├── tests/
+│   ├── test_idsm.cpp              # 20 IDSM unit tests (Google Test)
+│   ├── test_idsrm.cpp             # 19 IDSRM unit + integration tests
+│   └── mock_soc_server.py         # Python mock SOC endpoint for manual testing
+└── CMakeLists.txt
+```
+
+---
+
+## IDSM Configuration Reference
+
+### `IdsM_MonitorConfigType` — per-monitor, set at `IdsM_Init()`
+
+| Field | Type | Description |
+|:---|:---|:---|
+| `monitor_id` | `uint16_t` | Unique identifier for this detector |
+| `event_buffer_size` | `uint32_t` | Ring buffer capacity; oldest event dropped on overflow |
+| `flood_protection_ms` | `uint32_t` | Minimum milliseconds between DEM forwards (0 = disabled) |
+| `severity_threshold` | `IdsM_EventSeverityType` | Minimum severity to accept (LOW / MEDIUM / HIGH / CRITICAL) |
+| `enabled_in_pre_run` | `boolean` | Active during PRE_RUN_MODE |
+| `enabled_in_run` | `boolean` | Active during RUN_MODE |
+| `enabled_in_post_run` | `boolean` | Active during POST_RUN_MODE |
+
+**Example:**
+```c
+IdsM_MonitorConfigType configs[2] = {
+    // {MonitorID, BufferSize, FloodWindow_ms, Severity,    PreRun, Run, PostRun}
+    {0x001, 20, 100, IDSM_SEVERITY_HIGH,       true,  true,  false}, // CAN IDS
+    {0x002, 10,  50, IDSM_SEVERITY_CRITICAL,    true,  true,  true}  // SecOC
+};
+IdsM_Init(configs, 2);
+IdsM_SetOperatingMode(IDSM_RUN_MODE);
+```
+
+### IDSM Public API
+
+| Function | Description |
+|:---|:---|
+| `IdsM_Init(config, count)` | Initialize manager, start async worker |
+| `IdsM_DeInit()` | Stop worker, join thread, clear state |
+| `IdsM_SetOperatingMode(mode)` | Switch PRE_RUN / RUN / POST_RUN |
+| `IdsM_GetOperatingMode()` | Query current mode |
+| `IdsM_ReportEvent(event)` | Submit event to async queue (non-blocking, <1us) |
+| `IdsM_GetDetectionStatus(id)` | Get monitor violation status |
+| `IdsM_ResetDetectionStatus(id)` | Clear violation flag |
+| `IdsM_GetPendingEventCount(id)` | Count buffered events |
+| `IdsM_FlushEvents(id)` | Force-forward all buffered events |
+| `IdsM_SetDemReportCallback(cb)` | Register DEM callback (IDSRM sets this automatically) |
+| `IdsM_SetNvmStoreCallback(cb)` | Register NVM callback |
+
+---
+
+## IDSRM Module — SOC Violation Forwarding
+
+The IDSRM (Intrusion Detection System Reporting Module) forwards IDSM violations to a Security Operations Center via HTTP POST. **You do not need to build a SOC portal** — IDSRM sends JSON to any HTTP endpoint you point it at (Splunk HEC, QRadar, Elastic webhook, custom server, etc.).
+
+### How It Works
+
+1. `IdsRm_Init()` registers itself as the IDSM DEM callback
+2. When the IDSM worker fires the callback, IDSRM enqueues the event (<1us, non-blocking)
+3. IDSRM's own worker thread picks up events and HTTP POSTs JSON to the SOC URL
+4. Failed requests retry with exponential backoff (100ms, 200ms, 400ms...)
+
+### `IdsRm_ConfigType` — set at `IdsRm_Init()`, URL/token changeable at runtime
+
+| Field | Type | Description |
+|:---|:---|:---|
+| `soc_url` | `char[256]` | HTTP/HTTPS endpoint (e.g. `https://soc.company.com/api/violations`) |
+| `auth_token` | `char[512]` | Bearer token for `Authorization` header; empty string = no header |
+| `timeout_ms` | `uint32_t` | Per-request HTTP timeout in milliseconds |
+| `retry_count` | `uint8_t` | Number of retries on failure (max 10, exponential backoff) |
+| `enabled` | `boolean` | Initial enabled/disabled state |
+
+### Compile-Time Constants
+
+| Constant | Default | Description |
+|:---|:---|:---|
+| `IDSRM_MAX_URL_LEN` | 256 | Maximum SOC URL length |
+| `IDSRM_MAX_TOKEN_LEN` | 512 | Maximum auth token length |
+| `IDSRM_MAX_RETRY_COUNT` | 10 | Hard cap on retry_count |
+| `IDSRM_DEFAULT_QUEUE_DEPTH` | 128 | Max queued events before dropping |
+
+### IDSRM Public API
+
+| Function | Description |
+|:---|:---|
+| `IdsRm_Init(config)` | Initialize IDSRM, register DEM callback, start worker. Call after `IdsM_Init()`. |
+| `IdsRm_DeInit()` | Drain remaining events, stop worker, unregister callback |
+| `IdsRm_Enable()` | Enable forwarding (no-op if already enabled) |
+| `IdsRm_Disable()` | Disable forwarding; events silently dropped. Worker keeps running. |
+| `IdsRm_IsEnabled()` | Returns `true` if initialized AND enabled |
+| `IdsRm_SetSocUrl(url)` | Update SOC URL at runtime (thread-safe, takes effect on next POST) |
+| `IdsRm_SetAuthToken(token)` | Update bearer token at runtime (pass `""` to remove) |
+| `IdsRm_GetStats()` | Get snapshot: received, dropped, posted, failed, retries |
+| `IdsRm_ResetStats()` | Reset all counters to zero |
+
+### JSON Payload Format
+
+Each violation is POSTed as:
+```json
+{
+    "monitor_id": 1,
+    "event_id": 256,
+    "timestamp_ms": 42000,
+    "severity": "HIGH",
+    "payload": 3735928559
+}
+```
+
+### Usage Example
+
+```c
+#include "IdsM.h"
+#include "IdsRm.h"
+
+/* 1. Initialize IDSM */
+IdsM_MonitorConfigType mon = {0x001, 20, 100, IDSM_SEVERITY_HIGH, true, true, false};
+IdsM_Init(&mon, 1);
+IdsM_SetOperatingMode(IDSM_RUN_MODE);
+
+/* 2. Initialize IDSRM — must be called after IdsM_Init() */
+IdsRm_ConfigType rm_cfg = {};
+strncpy(rm_cfg.soc_url, "https://soc.company.com/api/idsm-violations", IDSRM_MAX_URL_LEN - 1);
+strncpy(rm_cfg.auth_token, "my-bearer-token", IDSRM_MAX_TOKEN_LEN - 1);
+rm_cfg.timeout_ms  = 3000;
+rm_cfg.retry_count = 2;
+rm_cfg.enabled     = true;
+IdsRm_Init(&rm_cfg);
+
+/* 3. Report violations as normal — IDSRM forwards them to the SOC automatically */
+IdsM_EventReportType evt = {0x001, 0x100, 42000, 0xDEADBEEF, IDSM_SEVERITY_HIGH};
+IdsM_ReportEvent(&evt);
+
+/* 4. Check stats */
+IdsRm_StatsType stats = IdsRm_GetStats();
+printf("posted=%u failed=%u\n", stats.events_posted, stats.events_failed);
+
+/* 5. Runtime control */
+IdsRm_Disable();                    /* pause forwarding */
+IdsRm_Enable();                     /* resume */
+IdsRm_SetSocUrl("http://backup-soc:8080/api/violations"); /* switch endpoint */
+
+/* 6. Shutdown (IDSRM first, then IDSM) */
+IdsRm_DeInit();
+IdsM_DeInit();
+```
+
+---
+
 ## Async Behavior & Threading Model
 
-- IdsM_ReportEvent() is non-blocking: Pushes event to a lock-free-ish queue and returns in <1µs
-- Background Worker Thread: Wakes on event submission, processes flood protection, buffers events, and forwards to DEM
-- Thread Safety: All public APIs are mutex-protected. Safe to call from CAN RX threads, SecOC verifiers, or OS tasks
-- Flood Protection: Configurable flood_protection_ms per monitor drops rapid duplicate violations automatically
-- Mode Isolation: Events submitted in disabled modes (e.g., Pre-Run) are rejected instantly with E_MODE_INVALID
+- `IdsM_ReportEvent()` is non-blocking: pushes event to queue and returns in <1us
+- **IDSM Worker Thread**: Wakes on event submission, processes flood protection, buffers events, forwards to DEM callback
+- **IDSRM Worker Thread**: Separate thread. Receives events from DEM callback, HTTP POSTs via libcurl. Uses TCP keep-alive for connection reuse.
+- **Thread Safety**: All public APIs are mutex-protected. Safe to call from CAN RX threads, SecOC verifiers, or OS tasks
+- **Flood Protection**: Configurable `flood_protection_ms` per monitor drops rapid duplicate violations
+- **Mode Isolation**: Events submitted in disabled modes are rejected instantly with `E_MODE_INVALID`
+
 ---
+
 ## How to Integrate External Modules (e.g., CAN IDS Toolkit)
 
-Step 1: Create an Adapter Class
-Wrap your detector in a thread-safe adapter that forwards violations to the IDSM:
+**Step 1:** Create an Adapter Class
 
 ```cpp
-// src/adapters/CanIdsToIdsMAdapter.hpp
 #pragma once
 #include "IdsM.h"
-#include "../modules/can-ids-toolkit/include/CanIdsEngine.h"
 
 class CanIdsToIdsMAdapter {
 public:
     explicit CanIdsToIdsMAdapter(IdsM_MonitorIdType monitor_id) : m_monitor_id(monitor_id) {}
 
-    // Call from your CAN RX thread when a violation is detected
-    void reportViolation(uint16_t event_id, IdsM_EventSeverityType severity, uint32_t context_payload) {
+    void reportViolation(uint16_t event_id, IdsM_EventSeverityType severity, uint32_t payload) {
         IdsM_EventReportType evt{};
         evt.monitor_id   = m_monitor_id;
         evt.event_id     = event_id;
         evt.severity     = severity;
-        evt.payload      = context_payload;
-        evt.timestamp_ms = get_platform_timestamp_ms(); // Implement per OS/RTOS
-
-        // Thread-safe, non-blocking submission to async IDSM
-        IdsM_ReportEvent(&evt);
+        evt.payload      = payload;
+        evt.timestamp_ms = get_platform_timestamp_ms();
+        IdsM_ReportEvent(&evt);  // non-blocking
     }
 
 private:
     IdsM_MonitorIdType m_monitor_id;
 };
 ```
-Step 2: Register Monitor in IDSM Configuration, Configure the IDSM to recognize your detector's monitor ID:
+
+**Step 2:** Register Monitor in IDSM Configuration
+
 ```cpp
 IdsM_MonitorConfigType configs[2] = {
-    // {MonitorID, BufferSize, FloodWindow_ms, Severity, PreRun, Run, PostRun}
-    {0x001, 20, 100, IDSM_SEVERITY_HIGH,   true,  true,  false}, // CAN IDS
-    {0x002, 10, 50,  IDSM_SEVERITY_CRITICAL, true,  true,  true}  // SecOC Verifier
+    {0x001, 20, 100, IDSM_SEVERITY_HIGH,     true, true, false}, // CAN IDS
+    {0x002, 10,  50, IDSM_SEVERITY_CRITICAL,  true, true, true}  // SecOC
 };
-
 IdsM_Init(configs, 2);
 IdsM_SetOperatingMode(IDSM_RUN_MODE);
 
 CanIdsToIdsMAdapter can_ids_adapter(0x001);
 ```
-Step 3: Link in CMakeLists.txt, Add your detector as a subdirectory and link it to your application:
-```cpp
-# Add detector module
-add_subdirectory(modules/can-ids-toolkit)
 
-# Link to your app or IDSM core
-target_link_libraries(your_app PRIVATE idsm_core can_ids_core)
-target_sources(your_app PRIVATE src/adapters/CanIdsToIdsMAdapter.cpp)
+**Step 3:** Link in CMakeLists.txt
+
+```cmake
+add_subdirectory(modules/can-ids-toolkit)
+target_link_libraries(your_app PRIVATE idsm_core idsrm_core can_ids_core)
 ```
-Step 4: Forward Violations in RX Callback
+
+**Step 4:** Forward Violations in RX Callback
+
 ```cpp
 void onCanFrameReceived(const CanFrame& frame) {
     auto result = can_ids_engine.validateFrame(frame);
     if (result.status != CanIdsResult::Status::Valid) {
-        // Returns instantly. Background thread handles processing & DEM forwarding.
         can_ids_adapter.reportViolation(0x10, IDSM_SEVERITY_HIGH, frame.id);
     }
 }
 ```
+
+---
+
 ## Build & Run
+
 ### Prerequisites
 
 | Component | Requirement | Arch Linux | Ubuntu/Debian |
-| :--- | :--- | :--- | :--- |
+|:---|:---|:---|:---|
 | **Compiler** | GCC 11+ / Clang 14+ | `sudo pacman -S base-devel` | `sudo apt install build-essential` |
-| **Build System** | CMake 3.16+, Ninja | `sudo pacman -S cmake ninja` | `sudo apt install cmake ninja-build` |
+| **Build System** | CMake 3.16+ | `sudo pacman -S cmake` | `sudo apt install cmake` |
+| **libcurl** | Required for IDSRM | `sudo pacman -S curl` | `sudo apt install libcurl4-openssl-dev` |
+| **Python 3** | Optional (mock SOC server) | pre-installed | pre-installed |
 
 ### Compile
+
 ```bash
 git clone https://github.com/niketdhale/autosar-idsm-toolkit.git
 cd autosar-idsm-toolkit
-mkdir build && cd build
-cmake .. -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
-ninja
-```
-### Run CLI
-```bash
-./idsm_cli
+cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build
 ```
 
-### CLI Usage Examples
+### Run CLI
+
 ```bash
-# 1. Initialize async manager & start background worker
+./build/idsm_cli
+```
+
+### CLI Usage
+
+```bash
+# Initialize IDSM + IDSRM (auto-connects to localhost:8080)
 init
 
-# 2. Switch to normal driving mode (activates Run-mode monitors)
+# Switch to normal driving mode
 mode run
 
-# 3. Simulate detector violation (returns instantly, processed async)
+# Simulate a detector violation (processed async, forwarded to SOC)
 report mon=0x001 evt=0x100 sev=2 pay=0xDEADBEEF
 
-# 4. Query monitor status
+# Query IDSM monitor status
 status 0x001
 
-# 5. Force flush buffered events (bypasses flood protection)
+# Force flush buffered events
 flush 0x001
 
-# 6. Graceful shutdown (stops worker, joins thread, clears state)
+# IDSRM controls
+idsrm status                          # show enabled state + stats
+idsrm disable                         # pause SOC forwarding
+idsrm enable                          # resume SOC forwarding
+idsrm url http://new-soc:9090/api/v2  # change SOC endpoint at runtime
+idsrm token my-new-bearer-token       # update auth token
+
+# Graceful shutdown
 quit
 ```
+
+### Manual Testing with Mock SOC Server
+
+```bash
+# Terminal 1: Start the mock SOC server
+python3 tests/mock_soc_server.py 8080
+
+# Terminal 2: Run the CLI
+./build/idsm_cli
+init
+mode run
+report mon=0x001 evt=0x100 sev=2 pay=0xDEADBEEF
+idsrm status   # events_posted should be 1
+quit
+```
+
+The mock server validates JSON structure and prints received events.
+
+---
+
+## Testing
+
+The project uses Google Test (fetched automatically via CMake FetchContent).
+
+### Run All Tests
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build
+cd build && ctest --output-on-failure
+```
+
+### Test Coverage
+
+| Suite | Tests | Description |
+|:---|:---:|:---|
+| **IdsMTest** | 20 | Lifecycle, mode management, event reporting, DEM callback, flood protection, detection status, multi-monitor |
+| **IdsRmPreInitTest** | 5 | Guard clauses: all APIs return error before `IdsRm_Init()` |
+| **IdsRmTest** | 8 | Init/DeInit, enable/disable toggle, stats tracking, null-pointer guards |
+| **IdsRmIntegrationTest** | 6 | In-process mock HTTP server: event posting, JSON validation, disable/enable, runtime URL change, multi-event |
+| **Total** | **39** | All tests pass |
+
+The IDSRM integration tests use an in-process POSIX socket server — no external Python server needed for automated testing.
+
+---
+
 ## AUTOSAR Compliance Notes
 
-| Specification Requirement | Implementation Status | Notes |
-| :--- | :---: | :--- |
+| Specification Requirement | Status | Notes |
+|:---|:---:|:---|
 | **Initialization/DeInit** | Compliant | [SWS_IdM_00100-00101] |
 | **Main Function (Runnable)** | Compliant | [SWS_IdM_00102] (async worker) |
 | **Operating Mode Management** | Compliant | [SWS_IdM_00103-00104] |
