@@ -8,4 +8,4 @@ CMakeCache.txt CMakeFiles/ cmake_install.cmake Makefile
 .vscode/ .idea/ *.swp *~ .DS_Store
 
 # OS
-*.log *.tmp *.bak
+*.log *.tmp *.bak *.claude
