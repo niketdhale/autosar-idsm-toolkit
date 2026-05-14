@@ -58,12 +58,15 @@ typedef struct {
     boolean enabled_in_post_run;
 } IdsM_MonitorConfigType;
 
-/* Event report structure per [SWS_IdM_00040] */
+/* Event report structure per [SWS_IdM_00040]
+   payload is a caller-owned buffer; IDSM deep-copies it internally.
+   Supports any size: CAN (13B), CAN-FD (69B), Ethernet (1514B), etc. */
 typedef struct {
-    IdsM_MonitorIdType monitor_id;
-    IdsM_EventIdType event_id;
-    uint32_t timestamp_ms;
-    uint32_t payload;
+    IdsM_MonitorIdType     monitor_id;
+    IdsM_EventIdType       event_id;
+    uint32_t               timestamp_ms;
+    const uint8_t*         payload;       /* caller-owned, copied on enqueue */
+    uint16_t               payload_len;   /* actual byte count              */
     IdsM_EventSeverityType severity;
 } IdsM_EventReportType;
 

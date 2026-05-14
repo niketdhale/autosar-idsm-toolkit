@@ -144,7 +144,7 @@ void IdsRm_Manager::OnDemEvent(const IdsM_EventReportType* event) {
             m_stats.events_dropped++;
             return;
         }
-        m_event_queue.push(*event);
+        m_event_queue.push(IdsM_OwnedEvent::from(*event));
     }
 
     {
@@ -161,7 +161,7 @@ void IdsRm_Manager::worker_loop() {
     initCurl();
 
     while (m_worker_running.load()) {
-        std::vector<IdsM_EventReportType> batch;
+        std::vector<IdsM_OwnedEvent> batch;
 
         {
             std::unique_lock<std::mutex> lock(m_queue_mutex);
@@ -173,7 +173,7 @@ void IdsRm_Manager::worker_loop() {
 
             /* Drain entire queue in one lock hold */
             while (!m_event_queue.empty()) {
-                batch.push_back(m_event_queue.front());
+                batch.push_back(std::move(m_event_queue.front()));
                 m_event_queue.pop();
             }
         }
@@ -184,11 +184,11 @@ void IdsRm_Manager::worker_loop() {
     }
 
     /* Best-effort drain of any events that arrived during shutdown */
-    std::vector<IdsM_EventReportType> remaining;
+    std::vector<IdsM_OwnedEvent> remaining;
     {
         std::lock_guard<std::mutex> lock(m_queue_mutex);
         while (!m_event_queue.empty()) {
-            remaining.push_back(m_event_queue.front());
+            remaining.push_back(std::move(m_event_queue.front()));
             m_event_queue.pop();
         }
     }
@@ -201,7 +201,7 @@ void IdsRm_Manager::worker_loop() {
 
 /* ───────────────────────── HTTP POST with retry ─────────────────────────── */
 
-bool IdsRm_Manager::postWithRetry(const IdsM_EventReportType& event) {
+bool IdsRm_Manager::postWithRetry(const IdsM_OwnedEvent& event) {
     uint8_t max_retries;
     {
         std::lock_guard<std::mutex> lock(m_config_mutex);
@@ -238,7 +238,7 @@ static size_t discard_response(char*, size_t size, size_t nmemb, void*) {
     return size * nmemb;
 }
 
-bool IdsRm_Manager::postEvent(const IdsM_EventReportType& event) {
+bool IdsRm_Manager::postEvent(const IdsM_OwnedEvent& event) {
     if (!m_curl_handle) return false;
 
     std::string url, token;
@@ -285,19 +285,38 @@ bool IdsRm_Manager::postEvent(const IdsM_EventReportType& event) {
 
 /* ───────────────────────── JSON builder ─────────────────────────────────── */
 
-void IdsRm_Manager::buildJsonPayload(const IdsM_EventReportType& event,
+void IdsRm_Manager::buildJsonPayload(const IdsM_OwnedEvent& event,
                                       std::string& out) const {
-    char buf[256];
-    std::snprintf(buf, sizeof(buf),
+    /* Build hex string from payload bytes */
+    std::string payload_hex;
+    payload_hex.reserve(event.payload.size() * 2);
+    for (uint8_t byte : event.payload) {
+        char hex[3];
+        std::snprintf(hex, sizeof(hex), "%02X", byte);
+        payload_hex += hex;
+    }
+
+    /* Use std::string instead of fixed buffer — payload can be any size */
+    char header[256];
+    std::snprintf(header, sizeof(header),
         "{\"monitor_id\":%u,\"event_id\":%u,"
         "\"timestamp_ms\":%u,\"severity\":\"%s\","
-        "\"payload\":%u}",
+        "\"payload\":\"",
         static_cast<unsigned>(event.monitor_id),
         static_cast<unsigned>(event.event_id),
         static_cast<unsigned>(event.timestamp_ms),
-        severityToString(event.severity),
-        static_cast<unsigned>(event.payload));
-    out = buf;
+        severityToString(event.severity));
+
+    char trailer[64];
+    std::snprintf(trailer, sizeof(trailer),
+        "\",\"payload_len\":%u}",
+        static_cast<unsigned>(event.payload.size()));
+
+    out.clear();
+    out.reserve(std::strlen(header) + payload_hex.size() + std::strlen(trailer));
+    out += header;
+    out += payload_hex;
+    out += trailer;
 }
 
 const char* IdsRm_Manager::severityToString(IdsM_EventSeverityType sev) const {

@@ -15,52 +15,52 @@ IdsM_Manager& IdsM_Manager::Instance() {
 /* Background Worker Loop */
 void IdsM_Manager::worker_loop() {
     while (m_worker_running.load()) {
-        std::vector<IdsM_EventReportType> local_batch;
-        
+        std::vector<IdsM_OwnedEvent> local_batch;
+
         // 1. Wait for events or shutdown signal
         {
             std::unique_lock<std::mutex> lock(m_mutex);
             m_queue_cv.wait(lock, [this] {
                 return !m_incoming_queue.empty() || !m_worker_running.load();
             });
-            
+
             if (!m_worker_running.load() && m_incoming_queue.empty()) break;
-            
+
             // Drain queue into local batch
             while (!m_incoming_queue.empty()) {
-                local_batch.push_back(m_incoming_queue.front());
+                local_batch.push_back(std::move(m_incoming_queue.front()));
                 m_incoming_queue.pop();
             }
         }
-        
+
         // 2. Process events (find monitor & buffer)
-        for (const auto& event : local_batch) {
+        for (auto& event : local_batch) {
             std::lock_guard<std::mutex> lock(m_mutex);
             auto it = m_monitors.find(event.monitor_id);
-            
+
             if (it != m_monitors.end() && it->second.active && isMonitorEnabledInMode(it->second)) {
                 it->second.status = IDSM_STATUS_VIOLATION;
-                
+
                 IdsM_InternalEvent internal_evt{};
-                internal_evt.report = event;
+                internal_evt.report = std::move(event);
                 internal_evt.first_seen_ns = getTimestampNs();
                 internal_evt.occurrence_count = 1;
-                
+
                 if (it->second.event_buffer.size() >= it->second.config.event_buffer_size) {
                     it->second.event_buffer.pop();
                 }
-                it->second.event_buffer.push(internal_evt);
+                it->second.event_buffer.push(std::move(internal_evt));
                 // ✅ DO NOT set last_report_ns here!
             }
         }
-        
+
         // 3. Process monitors (Flood protection & DEM forwarding)
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             uint64_t now_ns = getTimestampNs();
             for (auto& [id, mon] : m_monitors) {
                 if (!mon.active || !isMonitorEnabledInMode(mon)) continue;
-                
+
                 while (!mon.event_buffer.empty()) {
                     auto& evt = mon.event_buffer.front();
                     if (!isFloodProtected(mon, now_ns)) {
@@ -73,7 +73,7 @@ void IdsM_Manager::worker_loop() {
                 }
             }
         }
-        
+
         // Prevent 100% CPU usage
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
@@ -154,7 +154,7 @@ STD_RETURN_TYPE IdsM_Manager::ReportEvent(const IdsM_EventReportType* event) {
         if (it == m_monitors.end() || !it->second.active || !isMonitorEnabledInMode(it->second)) {
             return E_MODE_INVALID;
         }
-        m_incoming_queue.push(*event);
+        m_incoming_queue.push(IdsM_OwnedEvent::from(*event));
     }
     
     m_queue_cv.notify_one(); // Wake up worker immediately
@@ -220,9 +220,13 @@ bool IdsM_Manager::isFloodProtected(const IdsM_InternalMonitor& mon, uint64_t no
     return (now_ns - mon.last_report_ns) < min_interval_ns;
 }
 
-void IdsM_Manager::forwardToDem(const IdsM_EventReportType& event) {
+void IdsM_Manager::forwardToDem(const IdsM_OwnedEvent& event) {
     m_stats.events_flushed_to_dem++;
-    if (m_dem_cb) m_dem_cb(&event);
+    if (m_dem_cb) {
+        /* Reconstruct C struct; pointer is valid while 'event' is alive */
+        IdsM_EventReportType c_evt = event.to_c();
+        m_dem_cb(&c_evt);
+    }
 }
 
 uint64_t IdsM_Manager::getTimestampNs() const {

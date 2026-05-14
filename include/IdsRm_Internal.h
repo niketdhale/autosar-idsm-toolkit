@@ -4,6 +4,7 @@
 
 #ifdef __cplusplus
 
+#include "IdsM_Internal.h"  /* for IdsM_OwnedEvent */
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -52,7 +53,7 @@ private:
     std::atomic<bool>        m_worker_running{false};
     std::mutex               m_queue_mutex;   /* held only for enqueue/dequeue */
     std::condition_variable  m_queue_cv;
-    std::queue<IdsM_EventReportType> m_event_queue;
+    std::queue<IdsM_OwnedEvent> m_event_queue;
 
     /* Module state */
     std::atomic<bool> m_initialized{false};
@@ -76,9 +77,9 @@ private:
     void worker_loop();
 
     /* HTTP */
-    bool postWithRetry(const IdsM_EventReportType& event);
-    bool postEvent(const IdsM_EventReportType& event);
-    void buildJsonPayload(const IdsM_EventReportType& event, std::string& out) const;
+    bool postWithRetry(const IdsM_OwnedEvent& event);
+    bool postEvent(const IdsM_OwnedEvent& event);
+    void buildJsonPayload(const IdsM_OwnedEvent& event, std::string& out) const;
     const char* severityToString(IdsM_EventSeverityType sev) const;
 
     /* curl lifecycle (called from worker thread only) */

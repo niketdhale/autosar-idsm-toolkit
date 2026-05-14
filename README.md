@@ -7,6 +7,7 @@ A production-pattern, async-first C++17/C11 implementation of the AUTOSAR Intrus
 - **Async/Non-Blocking Core**: Background worker thread processes events instantly without blocking detector/communication threads
 - **AUTOSAR-Compliant C API**: `IdsM_Init`, `IdsM_ReportEvent`, `IdsM_SetOperatingMode`, `IdsM_MainFunction` (simulated)
 - **IDSRM SOC Forwarding**: HTTP POST violations to any Security Operations Center endpoint (Splunk, QRadar, Elastic, custom webhook)
+- **Dynamic Payload**: Variable-length payload buffer (deep-copied) — supports CAN 2.0 (13B), CAN FD (69B), Ethernet (1514B), or any custom context
 - **Pluggable Module Architecture**: Lightweight Adapter pattern for integrating CAN IDS, SecOC, FlexRay, Ethernet, or custom detectors
 - **Thread-Safe State Management**: Mutex-protected queues, condition variables, and atomic flags
 - **Event Buffering & Flood Protection**: Configurable per-monitor acceptance windows and anti-spam filtering
@@ -44,7 +45,7 @@ autosar-idsm-toolkit/
 ├── include/
 │   ├── IdsM_Types.h               # AUTOSAR type definitions, enums, config structs
 │   ├── IdsM.h                     # Public C API for IDSM
-│   ├── IdsM_Internal.h            # C++ IdsM_Manager singleton class
+│   ├── IdsM_Internal.h            # C++ IdsM_Manager singleton, IdsM_OwnedEvent (deep-copy)
 │   ├── IdsM_Manager_Wrapper.h     # C/C++ bridge for IDSM
 │   ├── IdsRm_Types.h              # IDSRM config, stats, return codes
 │   ├── IdsRm.h                    # Public C API for IDSRM
@@ -91,6 +92,21 @@ IdsM_MonitorConfigType configs[2] = {
 IdsM_Init(configs, 2);
 IdsM_SetOperatingMode(IDSM_RUN_MODE);
 ```
+
+### `IdsM_EventReportType` — event submitted via `IdsM_ReportEvent()`
+
+| Field | Type | Description |
+|:---|:---|:---|
+| `monitor_id` | `uint16_t` | Which monitor detected the violation |
+| `event_id` | `uint16_t` | Unique event identifier within this monitor |
+| `timestamp_ms` | `uint32_t` | Event timestamp in milliseconds |
+| `payload` | `const uint8_t*` | Caller-owned buffer with context data (deep-copied on enqueue) |
+| `payload_len` | `uint16_t` | Byte count of payload (any size: CAN=13B, CAN-FD=69B, Ethernet=1514B) |
+| `severity` | `IdsM_EventSeverityType` | LOW / MEDIUM / HIGH / CRITICAL |
+
+> **Note:** `payload` is a pointer to a caller-owned buffer. IDSM deep-copies the bytes
+> into an internal `std::vector<uint8_t>` when `IdsM_ReportEvent()` is called, so the
+> caller's buffer can safely go out of scope immediately after the call returns.
 
 ### IDSM Public API
 
@@ -163,9 +179,12 @@ Each violation is POSTed as:
     "event_id": 256,
     "timestamp_ms": 42000,
     "severity": "HIGH",
-    "payload": 3735928559
+    "payload": "00000123080102030405060708",
+    "payload_len": 13
 }
 ```
+
+The `payload` field is a hex-encoded byte string (e.g., CAN frame: 4B CAN-ID + 1B DLC + 8B data = 13 bytes → `"00000123080102030405060708"`). `payload_len` is the original byte count.
 
 ### Usage Example
 
@@ -188,8 +207,10 @@ rm_cfg.enabled     = true;
 IdsRm_Init(&rm_cfg);
 
 /* 3. Report violations as normal — IDSRM forwards them to the SOC automatically */
-IdsM_EventReportType evt = {0x001, 0x100, 42000, 0xDEADBEEF, IDSM_SEVERITY_HIGH};
-IdsM_ReportEvent(&evt);
+uint8_t context[] = {0x00, 0x00, 0x01, 0x23, 0x08,       /* CAN ID + DLC */
+                     0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}; /* CAN data */
+IdsM_EventReportType evt = {0x001, 0x100, 42000, context, sizeof(context), IDSM_SEVERITY_HIGH};
+IdsM_ReportEvent(&evt);  /* deep-copies payload internally */
 
 /* 4. Check stats */
 IdsRm_StatsType stats = IdsRm_GetStats();
@@ -209,7 +230,8 @@ IdsM_DeInit();
 
 ## Async Behavior & Threading Model
 
-- `IdsM_ReportEvent()` is non-blocking: pushes event to queue and returns in <1us
+- `IdsM_ReportEvent()` is non-blocking: deep-copies payload into `std::vector<uint8_t>`, pushes to queue, and returns in <1us
+- **Deep-Copy Ownership**: Payload bytes are copied at every queue boundary (IDSM enqueue, IDSRM enqueue). The caller's buffer can go out of scope immediately after `IdsM_ReportEvent()` returns.
 - **IDSM Worker Thread**: Wakes on event submission, processes flood protection, buffers events, forwards to DEM callback
 - **IDSRM Worker Thread**: Separate thread. Receives events from DEM callback, HTTP POSTs via libcurl. Uses TCP keep-alive for connection reuse.
 - **Thread Safety**: All public APIs are mutex-protected. Safe to call from CAN RX threads, SecOC verifiers, or OS tasks
@@ -225,25 +247,40 @@ IdsM_DeInit();
 ```cpp
 #pragma once
 #include "IdsM.h"
+#include <cstring>
+#include <vector>
 
 class CanIdsToIdsMAdapter {
 public:
     explicit CanIdsToIdsMAdapter(IdsM_MonitorIdType monitor_id) : m_monitor_id(monitor_id) {}
 
-    void reportViolation(uint16_t event_id, IdsM_EventSeverityType severity, uint32_t payload) {
+    void reportViolation(uint16_t event_id, IdsM_EventSeverityType severity,
+                         const CanFrame& frame) {
+        /* Pack CAN context: [CAN_ID (4B)] [DLC (1B)] [DATA (up to 8B)] = 13B for CAN 2.0 */
+        std::vector<uint8_t> buf(4 + 1 + frame.dlc);
+        uint32_t can_id = frame.id;
+        std::memcpy(&buf[0], &can_id, sizeof(can_id));
+        buf[4] = frame.dlc;
+        std::memcpy(&buf[5], frame.data, frame.dlc);
+
         IdsM_EventReportType evt{};
         evt.monitor_id   = m_monitor_id;
         evt.event_id     = event_id;
         evt.severity     = severity;
-        evt.payload      = payload;
         evt.timestamp_ms = get_platform_timestamp_ms();
-        IdsM_ReportEvent(&evt);  // non-blocking
+        evt.payload      = buf.data();   // IDSM deep-copies on enqueue
+        evt.payload_len  = static_cast<uint16_t>(buf.size());
+
+        IdsM_ReportEvent(&evt);  // non-blocking, deep-copies payload
     }
 
 private:
     IdsM_MonitorIdType m_monitor_id;
 };
 ```
+
+The `payload` field is a **dynamic pointer** — IDSM deep-copies the bytes internally.
+Any size is supported: CAN 2.0 (13B), CAN FD (69B), Ethernet (1514B), etc.
 
 **Step 2:** Register Monitor in IDSM Configuration
 
@@ -271,7 +308,7 @@ target_link_libraries(your_app PRIVATE idsm_core idsrm_core can_ids_core)
 void onCanFrameReceived(const CanFrame& frame) {
     auto result = can_ids_engine.validateFrame(frame);
     if (result.status != CanIdsResult::Status::Valid) {
-        can_ids_adapter.reportViolation(0x10, IDSM_SEVERITY_HIGH, frame.id);
+        can_ids_adapter.reportViolation(0x10, IDSM_SEVERITY_HIGH, frame);
     }
 }
 ```
@@ -314,7 +351,8 @@ init
 mode run
 
 # Simulate a detector violation (processed async, forwarded to SOC)
-report mon=0x001 evt=0x100 sev=2 pay=0xDEADBEEF
+# pay= takes a hex byte string: e.g., CAN ID 0x123 + DLC 8 + 8 data bytes
+report mon=0x001 evt=0x100 sev=2 pay=000001230801020304050607FF
 
 # Query IDSM monitor status
 status 0x001
@@ -343,7 +381,7 @@ python3 tests/mock_soc_server.py 8080
 ./build/idsm_cli
 init
 mode run
-report mon=0x001 evt=0x100 sev=2 pay=0xDEADBEEF
+report mon=0x001 evt=0x100 sev=2 pay=000001230801020304050607FF
 idsrm status   # events_posted should be 1
 quit
 ```

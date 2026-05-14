@@ -35,14 +35,19 @@ static IdsM_MonitorConfigType make_monitor(
     return m;
 }
 
+/* Persistent payload buffer for test events — must outlive ReportEvent call.
+   ReportEvent deep-copies, so this is safe as a static. */
+static uint8_t g_test_payload[1] = {0xAB};
+
 static IdsM_EventReportType make_event(uint16_t mon, uint16_t evt,
-                                        IdsM_EventSeverityType sev = IDSM_SEVERITY_HIGH,
-                                        uint32_t pay = 0xAB) {
+                                        IdsM_EventSeverityType sev = IDSM_SEVERITY_HIGH) {
     IdsM_EventReportType e{};
     e.monitor_id   = mon;
     e.event_id     = evt;
     e.severity     = sev;
-    e.payload      = pay;
+    g_test_payload[0] = 0xAB;
+    e.payload      = g_test_payload;
+    e.payload_len  = 1;
     e.timestamp_ms = 1000;
     return e;
 }

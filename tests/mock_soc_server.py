@@ -10,7 +10,7 @@ Listens on:
 
 Expected JSON payload:
     {"monitor_id": <uint>, "event_id": <uint>, "timestamp_ms": <uint>,
-     "severity": "LOW|MEDIUM|HIGH|CRITICAL", "payload": <uint>}
+     "severity": "LOW|MEDIUM|HIGH|CRITICAL", "payload": "<hex>", "payload_len": <uint>}
 
 Returns:
     200 {"status":"ok"}   on valid event
@@ -50,7 +50,8 @@ class SocHandler(BaseHTTPRequestHandler):
                 f"[SOC] monitor=0x{event['monitor_id']:04X}"
                 f"  event=0x{event['event_id']:04X}"
                 f"  severity={event['severity']:<8}"
-                f"  payload=0x{event['payload']:08X}"
+                f"  payload={event['payload']}"
+                f"  len={event.get('payload_len', '?')}"
                 f"  ts={event['timestamp_ms']}ms",
                 flush=True
             )

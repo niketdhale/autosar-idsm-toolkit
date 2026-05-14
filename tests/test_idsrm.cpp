@@ -50,12 +50,16 @@ static IdsM_MonitorConfigType make_monitor(uint16_t id) {
     return m;
 }
 
+/* Persistent payload buffer — must outlive ReportEvent call (deep-copied). */
+static uint8_t g_test_payload[4] = {0xDE, 0xAD, 0xBE, 0xEF};
+
 static IdsM_EventReportType make_event(uint16_t mon = 0x001, uint16_t evt = 0x100) {
     IdsM_EventReportType e{};
     e.monitor_id   = mon;
     e.event_id     = evt;
     e.severity     = IDSM_SEVERITY_HIGH;
-    e.payload      = 0xDEADBEEF;
+    e.payload      = g_test_payload;
+    e.payload_len  = sizeof(g_test_payload);
     e.timestamp_ms = 42000;
     return e;
 }
@@ -316,6 +320,8 @@ TEST_F(IdsRmIntegrationTest, JsonPayloadContainsExpectedFields) {
     EXPECT_NE(std::string::npos, body.find("\"timestamp_ms\""));
     EXPECT_NE(std::string::npos, body.find("\"severity\""));
     EXPECT_NE(std::string::npos, body.find("\"payload\""));
+    EXPECT_NE(std::string::npos, body.find("\"payload_len\""));
+    EXPECT_NE(std::string::npos, body.find("DEADBEEF"));  /* hex-encoded payload bytes */
     EXPECT_NE(std::string::npos, body.find("HIGH"));
     EXPECT_NE(std::string::npos, body.find("42000"));
 }

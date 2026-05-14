@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 int main() {
     std::cout << "=== AUTOSAR IDSM Simulator (Async) ===\n"
@@ -74,6 +75,8 @@ int main() {
 
         else if (cmd == "report" && initialized) {
             IdsM_EventReportType evt{};
+            /* Local buffer for parsed payload bytes — valid until ReportEvent copies */
+            std::vector<uint8_t> pay_buf;
             std::string param;
             while (iss >> param) {
                 auto eq = param.find('=');
@@ -83,8 +86,16 @@ int main() {
                 if      (k == "mon") evt.monitor_id = static_cast<uint16_t>(std::stoul(v, nullptr, 16));
                 else if (k == "evt") evt.event_id   = static_cast<uint16_t>(std::stoul(v, nullptr, 16));
                 else if (k == "sev") evt.severity   = static_cast<IdsM_EventSeverityType>(std::stoul(v));
-                else if (k == "pay") evt.payload    = static_cast<uint32_t>(std::stoul(v, nullptr, 16));
+                else if (k == "pay") {
+                    /* Parse hex byte string: pay=DEADBEEF → {0xDE,0xAD,0xBE,0xEF} */
+                    pay_buf.clear();
+                    for (size_t j = 0; j + 1 < v.size(); j += 2) {
+                        pay_buf.push_back(static_cast<uint8_t>(std::stoul(v.substr(j, 2), nullptr, 16)));
+                    }
+                }
             }
+            evt.payload     = pay_buf.empty() ? nullptr : pay_buf.data();
+            evt.payload_len = static_cast<uint16_t>(pay_buf.size());
             evt.timestamp_ms = static_cast<uint32_t>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now().time_since_epoch()).count() % 100000);

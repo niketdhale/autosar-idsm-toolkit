@@ -12,9 +12,45 @@
 #include <atomic>
 #include <condition_variable>
 
+/* Owned copy of an event report — deep-copies the payload bytes.
+   Used everywhere inside the C++ engine so that the caller's
+   buffer can safely go out of scope after IdsM_ReportEvent(). */
+struct IdsM_OwnedEvent {
+    IdsM_MonitorIdType     monitor_id;
+    IdsM_EventIdType       event_id;
+    uint32_t               timestamp_ms;
+    std::vector<uint8_t>   payload;       /* deep-copied from caller */
+    IdsM_EventSeverityType severity;
+
+    /* Construct from the public C struct */
+    static IdsM_OwnedEvent from(const IdsM_EventReportType& src) {
+        IdsM_OwnedEvent o;
+        o.monitor_id   = src.monitor_id;
+        o.event_id     = src.event_id;
+        o.timestamp_ms = src.timestamp_ms;
+        o.severity     = src.severity;
+        if (src.payload && src.payload_len > 0)
+            o.payload.assign(src.payload, src.payload + src.payload_len);
+        return o;
+    }
+
+    /* Reconstruct a temporary C struct (payload pointer into our vector).
+       The returned struct is only valid while this OwnedEvent is alive. */
+    IdsM_EventReportType to_c() const {
+        IdsM_EventReportType e{};
+        e.monitor_id   = monitor_id;
+        e.event_id     = event_id;
+        e.timestamp_ms = timestamp_ms;
+        e.severity     = severity;
+        e.payload      = payload.empty() ? nullptr : payload.data();
+        e.payload_len  = static_cast<uint16_t>(payload.size());
+        return e;
+    }
+};
+
 /* Internal event buffer entry */
 struct IdsM_InternalEvent {
-    IdsM_EventReportType report;
+    IdsM_OwnedEvent report;
     uint64_t first_seen_ns;
     uint32_t occurrence_count;
 };
@@ -66,7 +102,7 @@ private:
     std::thread m_worker_thread;
     std::atomic<bool> m_worker_running{false};
     std::condition_variable m_queue_cv;
-    std::queue<IdsM_EventReportType> m_incoming_queue; // Async event queue
+    std::queue<IdsM_OwnedEvent> m_incoming_queue; // Async event queue (deep-copied)
     
     /* --- STATE --- */
     mutable std::mutex m_mutex;
@@ -79,7 +115,7 @@ private:
     /* Helpers */
     bool isMonitorEnabledInMode(const IdsM_InternalMonitor& mon) const;
     bool isFloodProtected(const IdsM_InternalMonitor& mon, uint64_t now_ns) const;
-    void forwardToDem(const IdsM_EventReportType& event);
+    void forwardToDem(const IdsM_OwnedEvent& event);
     uint64_t getTimestampNs() const;
     void worker_loop(); /* Background thread entry point */
 };
